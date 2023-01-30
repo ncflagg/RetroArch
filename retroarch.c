@@ -1099,6 +1099,12 @@ static const camera_driver_t *camera_drivers[] = {
 
 /* MAIN GLOBAL VARIABLES */
 
+/* Seek past initial startup frames */
+static bool allow_core_run = true;
+static int warp_total = 0;
+/* Incrementing the loop prior to start so this value should be -1 initially? */
+static int warp_current = -1;
+
 #define DRIVERS_CMD_ALL \
       ( DRIVER_AUDIO_MASK \
       | DRIVER_VIDEO_MASK \
@@ -1513,6 +1519,7 @@ enum
    RA_OPT_VERSION,
    RA_OPT_EOF_EXIT,
    RA_OPT_LOG_FILE,
+   RA_OPT_WARP_START,
    RA_OPT_MAX_FRAMES,
    RA_OPT_MAX_FRAMES_SCREENSHOT,
    RA_OPT_MAX_FRAMES_SCREENSHOT_PATH,
@@ -20057,6 +20064,7 @@ static bool rarch_environment_cb(unsigned cmd, void *data)
 
          /* If the above function failed [possibly because it is not
           * implemented], use the refresh rate set in the config instead. */
+
          if (target_refresh_rate == 0.0 && video_refresh_rate != 0.0)
             target_refresh_rate = video_refresh_rate;
 
@@ -35204,6 +35212,59 @@ static void runahead_remove_hooks(struct rarch_state *p_rarch)
    remove_input_state_hook();
 }
 
+/* Seek past initial startup frames */
+static int warp_start(
+      struct rarch_state *p_rarch,
+      //int warp_total,
+      bool use_secondary)
+{
+/* Track seeked startup / initial frames */
+//int warp_current = 0;
+   warp_current++;
+   if (warp_current == warp_total)
+   {
+      /* Warp is done, so turn on audio and video */
+      p_rarch->audio_suspended     = false;
+      p_rarch->video_driver_active = true;
+
+      /* Restore 'sync content' setting */
+      //vrr_runloop_enable                      = settings->bools.vrr_runloop_enable;
+
+      //core_run();
+      //RUNAHEAD_RESUME_VIDEO();
+      /* Resync audio/video */
+      //p_rarch->input_is_dirty         = true;
+      //p_rarch->runahead_force_input_dirty = true;
+
+      return 0;
+   }
+   else
+   {
+      /* Run the initial frame with video enabled. May not be necessary */
+      if (warp_current == 1)
+      {
+         //p_rarch->audio_suspended     = true;
+         /* Inhibit input for 'warp_total' frames */
+         p_rarch->input_driver_flushing_input = warp_total;
+         core_run();
+         return 1;
+      }
+      else
+      /* Turn off audio and video and advance a frame */
+      {
+         if (warp_current == 2)
+         {
+            p_rarch->audio_suspended     = true;
+            p_rarch->video_driver_active = false;
+         }
+         core_run();
+         //RUNAHEAD_RESUME_VIDEO();
+         return 1;
+      }
+   }
+   //warp_last = warp_current;
+}
+
 static void runahead_destroy(struct rarch_state *p_rarch)
 {
    mylist_destroy(&p_rarch->runahead_save_state_list);
@@ -35791,9 +35852,14 @@ static void retroarch_print_help(const char *arg0)
 #endif
       strlcat(buf, "  -D, --detach          Detach program from the running console. "
             "Not relevant for all platforms.\n", sizeof(buf));
+
+      strlcat(buf, "      --warp-start <NUMBER>\n"
+            "                        At game load, seeks forward the specified number "
+            "of frames.\n", sizeof(buf));
       strlcat(buf, "      --max-frames=NUMBER\n"
             "                        Runs for the specified number of frames, "
             "then exits.\n", sizeof(buf));
+
 #ifdef HAVE_SCREENSHOTS
       strlcat(buf, "      --max-frames-ss\n"
             "                        Takes a screenshot at the end of max-frames.\n", sizeof(buf));
@@ -35878,6 +35944,7 @@ static void retroarch_parse_input_and_config(
       { "detach",             0, NULL, 'D' },
       { "features",           0, NULL, RA_OPT_FEATURES },
       { "subsystem",          1, NULL, RA_OPT_SUBSYSTEM },
+      { "warp-start",         1, NULL, RA_OPT_WARP_START },      
       { "max-frames",         1, NULL, RA_OPT_MAX_FRAMES },
       { "max-frames-ss",      0, NULL, RA_OPT_MAX_FRAMES_SCREENSHOT },
       { "max-frames-ss-path", 1, NULL, RA_OPT_MAX_FRAMES_SCREENSHOT_PATH },
@@ -36376,6 +36443,10 @@ static void retroarch_parse_input_and_config(
             case RA_OPT_RECORDCONFIG:
                strlcpy(global->record.config, optarg,
                      sizeof(global->record.config));
+               break;
+
+            case RA_OPT_WARP_START:
+               warp_total  = (unsigned)strtoul(optarg, NULL, 10);
                break;
 
             case RA_OPT_MAX_FRAMES:
@@ -39575,10 +39646,52 @@ int runloop_iterate(void)
       }
    }
 
-   if ((video_frame_delay > 0) && !p_rarch->input_driver_nonblock_state)
-      retro_sleep(video_frame_delay);
-
+   /* Seek past initial startup frames */
+   if (0 <= warp_current)
    {
+      if (warp_current < warp_total)
+      {
+         if (warp_start(p_rarch, false))
+         {
+            //allow_core_run = false;
+            
+            /* Don't process audio/video sync or runahead if warping past initial frames and allow core to run at unlimited rate */
+            goto max_core_speed;
+         }
+            
+         //else
+         //   /* Set input to dirty AFTER this core_run */
+         //   allow_core_run = true;
+      }
+      else if (warp_current == warp_total)
+      {
+         warp_current++;
+         /* Resync audio/video */
+         p_rarch->input_is_dirty = true;
+      }
+      else if (warp_current > warp_total)
+      {
+         /* Signal that warping in complete */
+         warp_current = -1;
+         if (p_rarch->input_is_dirty) p_rarch->input_is_dirty = false;
+      }
+   }
+   /* If I can determine when the core/game restarted and that the current game needs warp_start, set warp_current back to 0 */
+   /* Maybe make this the new first condition above */
+   //else if (game_needs_warp(current_game))
+   //   warp_current == 0;
+
+   /* Don't process frame delay if warping past initial frames */ 
+   //if (allow_core_run)
+   //{
+      if ((video_frame_delay > 0) && !p_rarch->input_driver_nonblock_state)
+         retro_sleep(video_frame_delay);
+   //}
+
+   /* Don't process runahead if warping past initial frames */ 
+   //if (allow_core_run)
+   {
+      
 #ifdef HAVE_RUNAHEAD
       unsigned run_ahead_num_frames = settings->uints.run_ahead_frames;
       /* Run Ahead Feature replaces the call to core_run in this loop */
@@ -39725,6 +39838,8 @@ end:
    }
 
    p_rarch->frame_limit_last_time  = cpu_features_get_time_usec();
+
+max_core_speed:
 
    return 0;
 }

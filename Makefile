@@ -46,6 +46,7 @@ else
 endif
 
 DEF_FLAGS += -Wall
+#DEF_FLAGS += -march=amdfam10
 
 ifneq ($(findstring BSD,$(OS)),)
    DEF_FLAGS += -DBSD
